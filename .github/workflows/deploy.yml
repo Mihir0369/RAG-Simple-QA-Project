@@ -14,6 +14,7 @@ env:
   ECR_REPOSITORY: rag-qa-system
   ECS_CLUSTER: default
   ECS_SERVICE: rag-qa-system-9e9e
+  ECS_SERVICE_ARN: arn:aws:ecs:us-east-2:476140239062:service/default/rag-qa-system-9e9e
   ECS_TASK_DEFINITION_FILE: task-definition.json
   CONTAINER_NAME: rag-qa-container
   APP_HEALTHCHECK_URL: https://ra-5e97c2223950411e82358e37609556ea.ecs.us-east-2.on.aws/health
@@ -83,11 +84,25 @@ jobs:
 
       - name: Download current ECS task definition
         run: |
-          TASK_DEF_ARN=$(aws ecs describe-services \
+          SERVICE_DESC=$(aws ecs describe-services \
             --cluster "${{ env.ECS_CLUSTER }}" \
-            --services "${{ env.ECS_SERVICE }}" \
-            --query "services[0].taskDefinition" \
-            --output text)
+            --services "${{ env.ECS_SERVICE_ARN }}" \
+            --output json)
+
+          FAILURE_REASON=$(echo "$SERVICE_DESC" | jq -r '.failures[0].reason // empty')
+          FAILURE_ARN=$(echo "$SERVICE_DESC" | jq -r '.failures[0].arn // empty')
+          if [ -n "$FAILURE_REASON" ]; then
+            echo "ECS describe-services failure: $FAILURE_REASON ($FAILURE_ARN)"
+            echo "Check ECS_CLUSTER and ECS_SERVICE_ARN values."
+            exit 1
+          fi
+
+          TASK_DEF_ARN=$(echo "$SERVICE_DESC" | jq -r '.services[0].taskDefinition // empty')
+          if [ -z "$TASK_DEF_ARN" ] || [ "$TASK_DEF_ARN" = "None" ]; then
+            echo "Could not resolve task definition ARN from ECS service."
+            echo "Check that service exists and has an active task definition."
+            exit 1
+          fi
 
           aws ecs describe-task-definition \
             --task-definition "$TASK_DEF_ARN" \
