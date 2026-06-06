@@ -75,3 +75,7 @@ Thumbs.db
 
 # Logs
 *.log
+
+# Local secret-bearing files
+ragcourse_accessKeys.csv
+New Text Document.txt
