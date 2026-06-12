@@ -1,144 +1,150 @@
-# ==================================================
-# RAG Q&A System - CD Pipeline (ECR + ECS)
-# ==================================================
-
-name: CD - Deploy to AWS
+name: CD - Deploy to AWS EC2
 
 on:
   push:
     branches: [main]
-  workflow_dispatch:  # Allow manual trigger
+  workflow_dispatch:
 
 env:
-  AWS_REGION: us-east-2
-  ECR_REPOSITORY: rag-qa-system
-  ECS_CLUSTER: default
-  ECS_SERVICE: rag-qa-system-9e9e
-  ECS_TASK_DEFINITION_FILE: task-definition.json
-  CONTAINER_NAME: rag-qa-container
-  APP_HEALTHCHECK_URL: https://ra-5e97c2223950411e82358e37609556ea.ecs.us-east-2.on.aws/health
+  IMAGE_NAME: rag-qa-system
+  CONTAINER_NAME: rag-qa-system
+  HOST_PORT: "8000"
+  CONTAINER_PORT: "8000"
+  APP_HEALTHCHECK_PATH: /health
 
 jobs:
-  # ============================================
-  # Build and Push to ECR
-  # ============================================
-  build-and-push:
-    name: Build & Push to ECR
+  build-image:
+    name: Build Docker Image
     runs-on: ubuntu-latest
     outputs:
-      image_uri: ${{ steps.build-image.outputs.image_uri }}
+      image_tag: ${{ steps.meta.outputs.image_tag }}
 
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@v4
-        with:
-          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          aws-region: ${{ env.AWS_REGION }}
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
 
-      - name: Login to Amazon ECR
-        id: login-ecr
-        uses: aws-actions/amazon-ecr-login@v2
-
-      - name: Build, tag, and push image to ECR
-        id: build-image
-        env:
-          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
-          IMAGE_TAG: ${{ github.sha }}
+      - name: Set image metadata
+        id: meta
         run: |
-          # Build Docker image
-          docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG .
-          docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:latest .
+          echo "image_tag=${{ github.sha }}" >> "$GITHUB_OUTPUT"
 
-          # Push both tags
-          docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
-          docker push $ECR_REGISTRY/$ECR_REPOSITORY:latest
+      - name: Build Docker image
+        run: |
+          docker build \
+            -t "${{ env.IMAGE_NAME }}:${{ steps.meta.outputs.image_tag }}" \
+            -t "${{ env.IMAGE_NAME }}:latest" \
+            .
 
-          # Output the image URI
-          echo "image_uri=$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG" >> $GITHUB_OUTPUT
+      - name: Export image tarball
+        run: |
+          docker save "${{ env.IMAGE_NAME }}:${{ steps.meta.outputs.image_tag }}" | gzip > rag-qa-image.tar.gz
+          ls -lh rag-qa-image.tar.gz
 
-          echo "✅ Image pushed: $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG"
+      - name: Upload image artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: rag-qa-image
+          path: rag-qa-image.tar.gz
+          if-no-files-found: error
+          retention-days: 1
 
-  # ============================================
-  # Deploy to ECS
-  # ============================================
-  deploy:
-    name: Deploy to ECS
+  deploy-to-ec2:
+    name: Deploy to EC2
     runs-on: ubuntu-latest
-    needs: build-and-push
+    needs: build-image
 
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@v4
+      - name: Download image artifact
+        uses: actions/download-artifact@v4
         with:
-          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          aws-region: ${{ env.AWS_REGION }}
+          name: rag-qa-image
 
-      - name: Download current ECS task definition
-        run: |
-          TASK_DEF_ARN=$(aws ecs describe-services \
-            --cluster "${{ env.ECS_CLUSTER }}" \
-            --services "${{ env.ECS_SERVICE }}" \
-            --query "services[0].taskDefinition" \
-            --output text)
-
-          aws ecs describe-task-definition \
-            --task-definition "$TASK_DEF_ARN" \
-            --query "taskDefinition" \
-            --output json > raw-task-definition.json
-
-          jq 'del(
-            .taskDefinitionArn,
-            .revision,
-            .status,
-            .requiresAttributes,
-            .compatibilities,
-            .registeredAt,
-            .registeredBy
-          )' raw-task-definition.json > "${{ env.ECS_TASK_DEFINITION_FILE }}"
-
-      - name: Render ECS task definition
-        id: task-def
-        uses: aws-actions/amazon-ecs-render-task-definition@v1
+      - name: Upload image tarball to EC2
+        uses: appleboy/scp-action@v0.1.7
         with:
-          task-definition: ${{ env.ECS_TASK_DEFINITION_FILE }}
-          container-name: ${{ env.CONTAINER_NAME }}
-          image: ${{ needs.build-and-push.outputs.image_uri }}
-          environment-variables: |
-            OPENAI_API_KEY=${{ secrets.OPENAI_API_KEY }}
-            QDRANT_URL=${{ secrets.QDRANT_URL }}
-            QDRANT_API_KEY=${{ secrets.QDRANT_API_KEY }}
-            LOG_LEVEL=INFO
-            LANGSMITH_TRACING=true
-            LANGSMITH_API_KEY=${{ secrets.LANGSMITH_API_KEY }}
-            LANGSMITH_PROJECT=rag-qa-production
-            LANGSMITH_ENDPOINT=https://eu.api.smith.langchain.com
+          host: ${{ secrets.EC2_HOST }}
+          username: ${{ secrets.EC2_USER }}
+          key: ${{ secrets.EC2_SSH_KEY }}
+          source: rag-qa-image.tar.gz
+          target: /tmp
 
-      - name: Deploy ECS task definition
-        id: deploy-ecs
-        uses: aws-actions/amazon-ecs-deploy-task-definition@v2
+      - name: Deploy container on EC2 over SSH
+        uses: appleboy/ssh-action@v1.2.0
+        env:
+          IMAGE_NAME: ${{ env.IMAGE_NAME }}
+          IMAGE_TAG: ${{ needs.build-image.outputs.image_tag }}
+          CONTAINER_NAME: ${{ env.CONTAINER_NAME }}
+          HOST_PORT: ${{ env.HOST_PORT }}
+          CONTAINER_PORT: ${{ env.CONTAINER_PORT }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          QDRANT_URL: ${{ secrets.QDRANT_URL }}
+          QDRANT_API_KEY: ${{ secrets.QDRANT_API_KEY }}
+          LANGSMITH_API_KEY: ${{ secrets.LANGSMITH_API_KEY }}
+          LANGSMITH_PROJECT: rag-qa-production
+          LANGSMITH_ENDPOINT: https://eu.api.smith.langchain.com
         with:
-          task-definition: ${{ steps.task-def.outputs.task-definition }}
-          service: ${{ env.ECS_SERVICE }}
-          cluster: ${{ env.ECS_CLUSTER }}
-          wait-for-service-stability: true
+          host: ${{ secrets.EC2_HOST }}
+          username: ${{ secrets.EC2_USER }}
+          key: ${{ secrets.EC2_SSH_KEY }}
+          script_stop: true
+          envs: IMAGE_NAME,IMAGE_TAG,CONTAINER_NAME,HOST_PORT,CONTAINER_PORT,OPENAI_API_KEY,QDRANT_URL,QDRANT_API_KEY,LANGSMITH_API_KEY,LANGSMITH_PROJECT,LANGSMITH_ENDPOINT
+          script: |
+            set -euo pipefail
 
-      - name: Output deployment details
-        run: |
-          echo "🚀 Deployment successful!"
-          echo "Cluster: ${{ env.ECS_CLUSTER }}"
-          echo "Service: ${{ env.ECS_SERVICE }}"
-          echo "Task Definition: ${{ steps.task-def.outputs.task-definition }}"
+            if ! command -v docker >/dev/null 2>&1; then
+              echo "Docker is not installed on EC2."
+              exit 1
+            fi
 
-      - name: Health Check
+            if [ ! -f /tmp/rag-qa-image.tar.gz ]; then
+              echo "Docker image artifact not found at /tmp/rag-qa-image.tar.gz"
+              exit 1
+            fi
+
+            gunzip -c /tmp/rag-qa-image.tar.gz | docker load
+            docker tag "${IMAGE_NAME}:${IMAGE_TAG}" "${IMAGE_NAME}:latest"
+
+            if docker ps -a --format '{{.Names}}' | grep -Eq "^${CONTAINER_NAME}$"; then
+              docker stop "$CONTAINER_NAME" || true
+              docker rm "$CONTAINER_NAME" || true
+            fi
+
+            docker run -d \
+              --name "$CONTAINER_NAME" \
+              --restart unless-stopped \
+              -p "${HOST_PORT}:${CONTAINER_PORT}" \
+              -e OPENAI_API_KEY="$OPENAI_API_KEY" \
+              -e QDRANT_URL="$QDRANT_URL" \
+              -e QDRANT_API_KEY="$QDRANT_API_KEY" \
+              -e LANGSMITH_TRACING=true \
+              -e LANGSMITH_API_KEY="$LANGSMITH_API_KEY" \
+              -e LANGSMITH_PROJECT="$LANGSMITH_PROJECT" \
+              -e LANGSMITH_ENDPOINT="$LANGSMITH_ENDPOINT" \
+              "${IMAGE_NAME}:${IMAGE_TAG}"
+
+            echo "Container status:"
+            docker ps --filter "name=${CONTAINER_NAME}" --format "table {{.Names}}\t{{.Image}}\t{{.Status}}\t{{.Ports}}"
+            echo "Recent logs:"
+            docker logs --tail 30 "$CONTAINER_NAME" || true
+
+            rm -f /tmp/rag-qa-image.tar.gz
+
+      - name: Verify health endpoint
         run: |
-          sleep 30
-          echo "Checking health endpoint..."
-          curl -f "${{ env.APP_HEALTHCHECK_URL }}" || echo "Health check pending..."
+          echo "Waiting for service to start..."
+          sleep 20
+
+          for attempt in {1..6}; do
+            if curl -fsS "http://${{ secrets.EC2_HOST }}:${{ env.HOST_PORT }}${{ env.APP_HEALTHCHECK_PATH }}" >/dev/null; then
+              echo "Deployment health check passed."
+              exit 0
+            fi
+            echo "Health check attempt ${attempt}/6 failed. Retrying..."
+            sleep 10
+          done
+
+          echo "Health check failed after retries."
+          exit 1
