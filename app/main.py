@@ -12,7 +12,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse
-#from fastapi.staticfiles import StaticFiles
+from fastapi.staticfiles import StaticFiles
 
 from app import __version__
 from app.api.routes import documents, health, query
@@ -72,29 +72,20 @@ app.add_middleware(
 )
 
 # Mount static files
-#app.mount("/static", StaticFiles(directory="static"), name="static")
+app.mount("/static", StaticFiles(directory="static"), name="static")
 
 # Include routers
 app.include_router(health.router)
 app.include_router(documents.router)
 app.include_router(query.router)
 
-@app.get("/", tags=["Root"])
-async def root():
-    """Root endpoint."""
-    return {
-        "message": f"Welcome to {settings.app_name}",
-        "version": __version__,
-        "docs": "/docs",
-    }
 
-'''
 @app.get("/", response_class=HTMLResponse, tags=["Root"])
 async def root():
     """Serve the main UI."""
     with open("static/index.html", "r") as f:
         return f.read()
-'''
+
 
 @app.exception_handler(Exception)
 async def global_exception_handler(request: Request, exc: Exception):
